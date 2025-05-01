@@ -1,153 +1,177 @@
 import warnings
 warnings.filterwarnings("ignore", message=".*resume_download.*")
-warnings.filterwarnings("ignore", message=".*use_reentrant.*")
-warnings.filterwarnings("ignore", message=".*byte fallback option.*", category=UserWarning)
 warnings.filterwarnings("ignore", message=".*TypedStorage is deprecated.*", category=UserWarning)
 
+import os
 import torch
+import torch.nn as nn
 import pandas as pd
 import numpy as np
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import accuracy_score
 from transformers import (
     AutoTokenizer,
-    AutoModelForSequenceClassification,
+    AutoModel,
     Trainer,
     TrainingArguments,
     DataCollatorWithPadding,
 )
 
-# ─────────────────────────────────────────────────────────────────────
-# 1) Streaming dataset: tokenize each sample on-the-fly (saves RAM)
-# ─────────────────────────────────────────────────────────────────────
-class StreamingEssayDataset(torch.utils.data.Dataset):
-    def __init__(self, texts, labels, tokenizer):
-        self.texts     = texts
-        self.labels    = labels
-        self.tokenizer = tokenizer
+# ─────────────────────────────────────────────────────────────────────────────
+class PPLStreamingDataset(torch.utils.data.Dataset):
+    def __init__(self, input_ids, attention_mask, labels, ppls):
+        self.input_ids     = input_ids
+        self.attention_mask= attention_mask
+        self.labels        = labels
+        self.ppls          = ppls
 
     def __len__(self):
-        return len(self.labels)
+        return self.labels.size(0)
 
     def __getitem__(self, idx):
-        enc = self.tokenizer(
-            self.texts[idx],
-            truncation=True,
-            padding="max_length",
-            max_length=512,
-            return_tensors="pt"
-        )
         return {
-            "input_ids":      enc["input_ids"].squeeze(0),
-            "attention_mask": enc["attention_mask"].squeeze(0),
-            "labels":         torch.tensor(self.labels[idx], dtype=torch.long),
+            "input_ids":      self.input_ids[idx],
+            "attention_mask": self.attention_mask[idx],
+            "labels":         self.labels[idx],
+            "ppl":            self.ppls[idx],
         }
 
-# ─────────────────────────────────────────────────────────────────────
-# 2) Main training flow
-# ─────────────────────────────────────────────────────────────────────
-def main():
-    # a) Load & normalize the CSV
-    df = pd.read_csv("./data/AI_Human.csv")
-    # rename label/class → generated
-    if "generated" not in df.columns:
-        if "label" in df.columns:
-            df = df.rename(columns={"label": "generated"})
-        elif "class" in df.columns:
-            df = df.rename(columns={"class": "generated"})
-        else:
-            raise ValueError("CSV must contain 'generated', 'label' or 'class'")
-    # map string labels → 0/1
-    if df["generated"].dtype == object:
-        df["generated"] = df["generated"].map({
-            "Human": 0, "human": 0,
-            "AI":    1, "ai":    1
-        })
+# ─────────────────────────────────────────────────────────────────────────────
+class PPLFusionModel(nn.Module):
+    def __init__(self, base_model: AutoModel):
+        super().__init__()
+        self.base = base_model
+        hidden_size = self.base.config.hidden_size
+        self.classifier = nn.Linear(hidden_size + 1, 2)
 
-    # b) Filter out short essays & drop duplicates
+    def forward(self, input_ids, attention_mask, labels=None, ppl=None):
+        outputs = self.base(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+        )
+        cls_emb = outputs.last_hidden_state[:, 0]
+        fused   = torch.cat([cls_emb, ppl.unsqueeze(1)], dim=1)
+        logits  = self.classifier(fused)
+
+        loss = None
+        if labels is not None:
+            loss = nn.CrossEntropyLoss()(logits, labels)
+        return {"loss": loss, "logits": logits}
+
+    def save_pretrained(self, save_directory: str):
+        os.makedirs(save_directory, exist_ok=True)
+        self.base.save_pretrained(save_directory)
+        torch.save(
+            self.classifier.state_dict(),
+            os.path.join(save_directory, "classifier_head.pth")
+        )
+
+# ─────────────────────────────────────────────────────────────────────────────
+def main():
+    # a) Load & normalize
+    df = pd.read_csv("./data/AI_Human_with_ppl.csv")
+    if "generated" not in df.columns:
+        for c in ("label","class"):
+            if c in df.columns:
+                df = df.rename(columns={c: "generated"}); break
+    if df["generated"].dtype == object:
+        df["generated"] = df["generated"].map({"Human":0,"human":0,"AI":1,"ai":1})
+
+    # b) Filter & dedupe
     df = (
         df[df["text"].str.split().str.len() >= 150]
-        .drop_duplicates(subset="text")
-        .reset_index(drop=True)
+          .drop_duplicates("text")
+          .reset_index(drop=True)
     )
 
-    # c) Balance AI vs. Human classes
-    ai    = df[df.generated == 1]
-    human = df[df.generated == 0]
-    n     = min(len(ai), len(human))
-    df    = (
-        pd.concat([
+    # c) Balance
+    ai    = df[df.generated==1]
+    hum   = df[df.generated==0]
+    n     = min(len(ai), len(hum))
+    df = pd.concat([
             ai.sample(n=n, random_state=42),
-            human.sample(n=n, random_state=42)
-        ])
-        .sample(frac=1, random_state=42)
-        .reset_index(drop=True)
+            hum.sample(n=n, random_state=42)
+        ]).sample(frac=1, random_state=42).reset_index(drop=True)
+
+    # d) Split
+    texts, labs, ppls = df["text"].tolist(), df["generated"].tolist(), df["ppl_gpt2"].tolist()
+    tr_txt, vl_txt, tr_lab, vl_lab, tr_ppl, vl_ppl = train_test_split(
+        texts, labs, ppls, test_size=0.2, random_state=42
     )
 
-    # d) Train/validation split
-    texts  = df["text"].tolist()
-    labels = df["generated"].tolist()
-    train_texts, val_texts, train_labels, val_labels = train_test_split(
-        texts, labels, test_size=0.2, random_state=42
-    )
-
-    # e) Tokenizer & model – DeBERTa-v3-large
+    # e) Pre-tokenize (256 tokens)
+    MAX_LEN = 256
     tokenizer = AutoTokenizer.from_pretrained("microsoft/deberta-v3-large")
-    model     = AutoModelForSequenceClassification.from_pretrained(
-        "microsoft/deberta-v3-large",
-        num_labels=2
-    ).to(device)
+    tr_enc = tokenizer(tr_txt, truncation=True, padding="max_length", max_length=MAX_LEN, return_tensors="pt")
+    vl_enc = tokenizer(vl_txt, truncation=True, padding="max_length", max_length=MAX_LEN, return_tensors="pt")
 
-    # f) Prepare streaming datasets
-    train_dataset = StreamingEssayDataset(train_texts, train_labels, tokenizer)
-    val_dataset   = StreamingEssayDataset(val_texts,   val_labels,   tokenizer)
+    # f) Datasets
+    train_ds = PPLStreamingDataset(
+        tr_enc.input_ids, tr_enc.attention_mask,
+        torch.tensor(tr_lab, dtype=torch.long),
+        torch.tensor(tr_ppl, dtype=torch.float),
+    )
+    val_ds = PPLStreamingDataset(
+        vl_enc.input_ids, vl_enc.attention_mask,
+        torch.tensor(vl_lab, dtype=torch.long),
+        torch.tensor(vl_ppl, dtype=torch.float),
+    )
 
-    # g) Metrics & collator
+    # g) Model + checkpointing
+    base = AutoModel.from_pretrained("microsoft/deberta-v3-large")
+    base.gradient_checkpointing_enable()   # ← crucial for memory
+    model = PPLFusionModel(base).to(device)
+
     def compute_metrics(p):
         preds = np.argmax(p.predictions, axis=1)
         return {"accuracy": accuracy_score(p.label_ids, preds)}
 
     collator = DataCollatorWithPadding(tokenizer)
 
-    # h) TrainingArguments with frequent checkpointing
+    # h) TrainingArguments: B=2, accum=4, fp16, eval/save per epoch
     training_args = TrainingArguments(
-        output_dir="./saved_model_deberta_stream",
-        num_train_epochs=3,
-        per_device_train_batch_size=4,
-        per_device_eval_batch_size=4,
-        gradient_accumulation_steps=2,
+        output_dir="./saved_model_deberta_ppl",
+        seed=42,
+        num_train_epochs=4,
 
-        evaluation_strategy="steps",
-        save_strategy="steps",
-        save_steps=2000,        # checkpoint every 2000 updates
-        save_total_limit=5,     # keep only last 5
+        per_device_train_batch_size=1,       # ↓↓
+        gradient_accumulation_steps=4,       # ↕
+        per_device_eval_batch_size=8,
 
-        logging_steps=100,
+        evaluation_strategy="epoch",
+        save_strategy="epoch",
+        save_total_limit=3,
+        logging_steps=200,
         load_best_model_at_end=True,
         metric_for_best_model="accuracy",
 
+        learning_rate=3e-5,
+        weight_decay=0.01,
+        warmup_steps=1000,
+        lr_scheduler_type="linear",
+        max_grad_norm=1.0,
+
         fp16=True,
-        gradient_checkpointing=True,
-        dataloader_num_workers=0,
+        dataloader_num_workers=4,
     )
 
-    # i) Trainer setup & train with resume support
+    # i) Trainer → train
     trainer = Trainer(
         model=model,
         args=training_args,
-        train_dataset=train_dataset,
-        eval_dataset=val_dataset,
+        train_dataset=train_ds,
+        eval_dataset=val_ds,
         data_collator=collator,
         compute_metrics=compute_metrics,
     )
     trainer.train()
 
-    # j) Save model & tokenizer
-    model.save_pretrained("./saved_model_deberta_stream")
-    tokenizer.save_pretrained("./saved_model_deberta_stream")
-    print("✅ Stream-mode DeBERTa training complete — saved in ./saved_model_deberta_stream")
+    # j) Save
+    model.save_pretrained(training_args.output_dir)
+    tokenizer.save_pretrained(training_args.output_dir)
+    print("✅ Done — saved to", training_args.output_dir)
 
-if __name__ == "__main__":
+if __name__=="__main__":
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print("Using device:", device)
     main()
